@@ -2,11 +2,20 @@ import { Anthropic } from "@anthropic-ai/sdk";
 import {
   MessageParam,
   Tool,
+  ToolResultBlockParam,
+  ToolUseBlockParam,
+  MessageStreamEvent,
+  ContentBlockDeltaEvent,
+  ContentBlockStartEvent,
+  ContentBlockStopEvent,
 } from "@anthropic-ai/sdk/resources/messages/messages.mjs";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import readline from "readline/promises";
+import fs from "fs/promises";
+import path from "path";
+import os from "os";
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 if (!ANTHROPIC_API_KEY) {
@@ -14,12 +23,20 @@ if (!ANTHROPIC_API_KEY) {
 }
 
 const MAX_TOKENS = 4096;
+const GREEN = "\x1b[32m";
+const BLUE = "\x1b[34m";
+const RESET = "\x1b[0m";
+
+const HISTORY_FILE = path.join(os.homedir(), ".mcpchathistory");
 
 class MCPClient {
   private mcp: Client;
   private anthropic: Anthropic;
   private transport: StdioClientTransport | null = null;
   private tools: Tool[] = [];
+  private messageHistory: MessageParam[] = [];
+  private rl: readline.Interface | null = null;
+  private commandHistory: string[] = [];
 
   constructor(public model: string = "claude-3-5-sonnet-20241022") {
     // Initialize Anthropic client and MCP client
@@ -27,6 +44,24 @@ class MCPClient {
       apiKey: ANTHROPIC_API_KEY,
     });
     this.mcp = new Client({ name: "mcp-client-cli", version: "1.0.0" });
+  }
+
+  private async loadHistory(): Promise<void> {
+    try {
+      const historyContent = await fs.readFile(HISTORY_FILE, "utf-8");
+      this.commandHistory = historyContent.split("\n").filter(Boolean);
+    } catch (error) {
+      // File doesn't exist or is empty, that's fine
+      this.commandHistory = [];
+    }
+  }
+
+  private async saveHistory(): Promise<void> {
+    try {
+      await fs.writeFile(HISTORY_FILE, this.commandHistory.join("\n") + "\n");
+    } catch (error) {
+      console.error("Failed to save history:", error);
+    }
   }
 
   async connectToServer(serverScriptPath: string) {
@@ -122,18 +157,17 @@ class MCPClient {
      * @param query - The user's input query
      * @returns Processed response as a string
      */
-    const messages: MessageParam[] = [
-      {
-        role: "user",
-        content: query,
-      },
-    ];
+    // Add user query to message history
+    this.messageHistory.push({
+      role: "user",
+      content: query,
+    });
 
-    // Initial Claude API call
+    // Initial Claude API call with full message history
     const response = await this.anthropic.messages.create({
       model: this.model,
       max_tokens: MAX_TOKENS,
-      messages,
+      messages: this.messageHistory,
       tools: this.tools,
     });
 
@@ -144,6 +178,11 @@ class MCPClient {
     for (const content of response.content) {
       if (content.type === "text") {
         finalText.push(content.text);
+        // Add assistant's text response to message history
+        this.messageHistory.push({
+          role: "assistant",
+          content: content.text,
+        });
       } else if (content.type === "tool_use") {
         // Execute tool call
         const toolName = content.name;
@@ -155,54 +194,267 @@ class MCPClient {
         });
         toolResults.push(result);
         finalText.push(
-          `[Calling tool ${toolName} with args ${JSON.stringify(toolArgs)}]`
+          `${GREEN}[Tool Call] ${toolName}${RESET}\n${GREEN}Arguments: ${JSON.stringify(
+            toolArgs,
+            null,
+            2
+          )}${RESET}`
         );
 
-        // Continue conversation with tool results
-        messages.push({
-          role: "user",
-          content: result.content as string,
+        // Add tool use to message history
+        this.messageHistory.push({
+          role: "assistant",
+          content: [content as ToolUseBlockParam],
         });
 
-        // Get next response from Claude
+        // Add tool result to message history
+        const toolResult: ToolResultBlockParam = {
+          tool_use_id: content.id,
+          type: "tool_result",
+          content: result.content as string,
+        };
+        this.messageHistory.push({
+          role: "user",
+          content: [toolResult],
+        });
+
+        // Get next response from Claude with full message history
         const response = await this.anthropic.messages.create({
           model: this.model,
           max_tokens: 1000,
-          messages,
+          messages: this.messageHistory,
         });
 
-        finalText.push(
-          response.content[0].type === "text" ? response.content[0].text : ""
-        );
+        const responseText =
+          response.content[0].type === "text" ? response.content[0].text : "";
+        finalText.push(responseText);
+        // Add assistant's final response to message history
+        this.messageHistory.push({
+          role: "assistant",
+          content: responseText,
+        });
       }
     }
 
     return finalText.join("\n");
   }
 
+  async processQueryStream(query: string, onToken: (token: string) => void) {
+    /**
+     * Process a query using Claude and available tools with streaming response
+     *
+     * @param query - The user's input query
+     * @param onToken - Callback function to handle each token of the response
+     */
+    // Add user query to message history
+    this.messageHistory.push({
+      role: "user",
+      content: query,
+    });
+
+    let currentText = "";
+    let currentToolUse: ToolUseBlockParam | null = null;
+    let currentToolInput = "";
+
+    // Stream the response
+    const stream = await this.anthropic.messages.create({
+      model: this.model,
+      max_tokens: MAX_TOKENS,
+      messages: this.messageHistory,
+      tools: this.tools,
+      stream: true,
+    });
+
+    for await (const chunk of stream) {
+      const event = chunk as MessageStreamEvent;
+
+      if (event.type === "content_block_start") {
+        const start = event as ContentBlockStartEvent;
+        if (start.content_block.type === "tool_use") {
+          currentToolUse = {
+            id: start.content_block.id,
+            type: "tool_use",
+            name: start.content_block.name,
+            input: {},
+          };
+          onToken(
+            `\n${GREEN}[Tool Call] ${start.content_block.name}${RESET}\n`
+          );
+        }
+      } else if (event.type === "content_block_delta") {
+        const delta = event as ContentBlockDeltaEvent;
+        if (delta.delta.type === "text_delta") {
+          currentText += delta.delta.text;
+          onToken(delta.delta.text);
+        } else if (delta.delta.type === "input_json_delta" && currentToolUse) {
+          currentToolInput += delta.delta.partial_json;
+          onToken(`${GREEN}${delta.delta.partial_json}${RESET}`);
+        }
+      } else if (event.type === "content_block_stop" && currentToolUse) {
+        // Parse the complete JSON input
+        try {
+          const input = JSON.parse(currentToolInput);
+          currentToolUse.input = input;
+
+          // Execute tool call
+          const result = await this.mcp.callTool({
+            name: currentToolUse.name,
+            arguments: input,
+          });
+
+          // Add tool use and result to message history
+          this.messageHistory.push({
+            role: "assistant",
+            content: [currentToolUse],
+          });
+
+          const toolResult: ToolResultBlockParam = {
+            tool_use_id: currentToolUse.id,
+            type: "tool_result",
+            content: result.content as string,
+          };
+          this.messageHistory.push({
+            role: "user",
+            content: [toolResult],
+          });
+
+          onToken(
+            `\n${BLUE}Result: ${JSON.stringify(
+              result.content,
+              null,
+              2
+            )}${RESET}\n`
+          );
+
+          // Get next response from Claude with full message history
+          const response = await this.anthropic.messages.create({
+            model: this.model,
+            max_tokens: 1000,
+            messages: this.messageHistory,
+            stream: true,
+          });
+
+          for await (const responseChunk of response) {
+            const responseEvent = responseChunk as MessageStreamEvent;
+            if (responseEvent.type === "content_block_delta") {
+              const delta = responseEvent as ContentBlockDeltaEvent;
+              if (delta.delta.type === "text_delta") {
+                onToken(delta.delta.text);
+              }
+            }
+          }
+        } catch (error) {
+          console.error("Error parsing tool input JSON:", error);
+        }
+
+        currentToolUse = null;
+        currentToolInput = "";
+      }
+    }
+
+    // Add the complete response to message history
+    if (currentText) {
+      this.messageHistory.push({
+        role: "assistant",
+        content: currentText,
+      });
+    }
+  }
+
+  private async handleSpecialCommand(message: string): Promise<boolean> {
+    /**
+     * Handle special commands like quit, exit, history
+     * @param message - The user's input message
+     * @returns true if the message was handled as a special command
+     */
+    const trimmed = message.trim().toLowerCase();
+
+    switch (trimmed) {
+      case "quit":
+      case "exit":
+        return true;
+
+      default:
+        if (trimmed.startsWith("history")) {
+          const args = trimmed.slice("history".length).trim();
+          let count = 20; // Default to last 20 commands
+
+          if (args) {
+            // Handle both "history N" and "history -n N" formats
+            const match = args.match(/^(-n\s+)?(\d+)$/);
+            if (match) {
+              count = parseInt(match[2], 10);
+            } else {
+              console.log("Usage: history [N] or history -n N");
+              return true;
+            }
+          }
+
+          // Get the last N commands
+          const start = Math.max(0, this.commandHistory.length - count);
+          const history = this.commandHistory.slice(start);
+
+          // Print with line numbers
+          history.forEach((cmd: string, index: number) => {
+            console.log(`${start + index + 1}  ${cmd}`);
+          });
+          return true;
+        }
+        return false;
+    }
+  }
+
   async chatLoop() {
     /**
-     * Run an interactive chat loop
+     * Run an interactive chat loop with streaming responses
      */
-    const rl = readline.createInterface({
+    // Load command history
+    await this.loadHistory();
+
+    // Create readline interface
+    this.rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
+      history: this.commandHistory,
+      historySize: 1000, // Keep last 1000 commands
     });
 
     try {
-      console.log("\nMCP Client Started!");
-      console.log("Type your queries or 'quit' to exit.");
+      console.log("\nWelcome to MCP Chat Interactive!");
+      console.log("See connected server(s) with tools above.");
+      console.log("Commands:");
+      console.log("  exit, quit - Close the chat");
+      console.log("  history [N] - View last N commands (default 20)");
+      console.log("\nPress up/down arrow keys to navigate command history.");
+      console.log("Use 'Ctrl+C' to exit at any time.");
 
       while (true) {
-        const message = await rl.question("\nQuery: ");
-        if (message.toLowerCase() === "quit") {
-          break;
+        const message = await this.rl.question("\n> ");
+
+        // Handle special commands first
+        if (await this.handleSpecialCommand(message)) {
+          const trimmed = message.trim().toLowerCase();
+          if (trimmed === "quit" || trimmed === "exit") {
+            break;
+          }
+          continue;
         }
-        const response = await this.processQuery(message);
-        console.log("\n" + response);
+
+        // Add message to history
+        if (message.trim()) {
+          // Save history before running each command
+          await this.saveHistory();
+        }
+
+        // Process the query with streaming response
+        await this.processQueryStream(message, (token) => {
+          process.stdout.write(token);
+        });
+        console.log("\n"); // Add a newline after the response
       }
     } finally {
-      rl.close();
+      this.rl.close();
+      this.rl = null;
     }
   }
 
@@ -225,7 +477,6 @@ async function setupChat(options: ChatOptions): Promise<MCPClient> {
 
   if (options.servers) {
     for (const server of options.servers) {
-      console.log(server);
       try {
         await mcpClient.connectToServer(server);
       } catch (err) {
