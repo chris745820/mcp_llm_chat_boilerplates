@@ -1,6 +1,6 @@
 {
   "name": "mcp-chat",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Open Source Generic MCP Client for testing & evaluating mcp servers and agents",
   "license": "MIT",
   "type": "module",
