@@ -20,6 +20,8 @@ This will open up a chat prompt that you can use to interact with the servers an
 
 ## Web mode
 
+https://github.com/user-attachments/assets/b7e8a648-8084-4955-8cdf-fc6eb141572e
+
 You can also run mcp-chat in web mode by specifying the `--web` flag (make sure to have `ANTHROPIC_API_KEY` exported in your environment):
 
 ```shell
