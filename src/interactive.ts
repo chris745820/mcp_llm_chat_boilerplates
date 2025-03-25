@@ -16,6 +16,7 @@ import fs from "fs/promises";
 import path from "path";
 import os from "os";
 import { Stream } from "@anthropic-ai/sdk/streaming.mjs";
+import { DEFAULT_MODEL } from "./constants.js";
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 if (!ANTHROPIC_API_KEY) {
@@ -72,7 +73,7 @@ export class MCPClient {
   public systemPrompt: string | undefined;
 
   constructor(private options: ChatOptions = {}) {
-    this.model = options.model || "claude-3-5-sonnet-20241022";
+    this.model = options.model || DEFAULT_MODEL;
     this.systemPrompt = options.systemPrompt;
 
     // Initialize Anthropic client and MCP client
@@ -119,7 +120,8 @@ export class MCPClient {
 
   async loadChatFile(
     chatFile: string,
-    printHistory: boolean = true
+    printHistory: boolean = true,
+    disableServers: boolean = false
   ): Promise<void> {
     try {
       const content = await fs.readFile(chatFile, "utf-8");
@@ -137,7 +139,11 @@ export class MCPClient {
         if (!this.options.systemPrompt) {
           this.systemPrompt = chatData.settings.systemPrompt;
         }
-        if (!this.options.servers && chatData.settings.servers) {
+        if (
+          !this.options.servers &&
+          chatData.settings.servers &&
+          !disableServers
+        ) {
           // Reconnect to servers from the chat file
           for (const server of chatData.settings.servers) {
             try {
@@ -251,6 +257,17 @@ export class MCPClient {
       const isNpx = serverScriptPath.includes("npx");
       const isUvx = serverScriptPath.includes("uvx");
       let serverWithoutCommand = serverScriptPath;
+
+      // Clean up any existing transport
+      if (this.transport) {
+        try {
+          await this.transport.close();
+        } catch (err) {
+          console.warn("Error closing existing transport:", err);
+        }
+        this.transport = null;
+      }
+
       if (isNpx) {
         const allArgs = serverScriptPath.split(" ");
         const command = allArgs[0];
@@ -340,6 +357,18 @@ export class MCPClient {
       );
     } catch (e) {
       console.log("Failed to connect to MCP server: ", e);
+      // Clean up transport on error
+      if (this.transport) {
+        try {
+          await this.transport.close();
+        } catch (err) {
+          console.warn(
+            "Error closing transport after connection failure:",
+            err
+          );
+        }
+        this.transport = null;
+      }
       throw e;
     }
   }
