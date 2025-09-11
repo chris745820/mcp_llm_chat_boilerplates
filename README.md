@@ -1,4 +1,6 @@
 
+# mcp-chat
+
 <div align="right">
   <details>
     <summary >🌐 Language</summary>
@@ -28,9 +30,8 @@
       </div>
     </div>
   </details>
-</div>
 
-# mcp-chat
+</div>
 
 Open Source Generic MCP Client for testing & evaluating mcp servers and agents
 
