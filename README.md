@@ -204,4 +204,4 @@ This will create a new tag which will trigger a new release build via the cd.yml
 
 ## License
 
-[MIT License](https://github.com/Flux159/mcp-chat/blob/main/LICENSE)
+[MIT License](https://github.com/chris745820/mcp_llm_chat_boilerplates/blob/main/LICENSE)
